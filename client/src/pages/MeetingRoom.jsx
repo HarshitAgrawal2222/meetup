@@ -5,6 +5,8 @@ import VideoGrid from '../components/meeting/VideoGrid'
 import useWebRTC from '../hooks/useWebRTC'
 import { useChat } from '../hooks/useChat'
 import ChatPanel from '../components/meeting/ChatPanel'
+import ParticipantList from '../components/meeting/ParticipantList'
+import ControlBar from '../components/meeting/ControlBar'
 
 
 const MeetingRoom = () => {
@@ -26,9 +28,16 @@ const { messages, sendMessage, unreadCount, isChatOpen, toggleChat } = useChat(m
 
     const isHost = true;
 
-    const handleLeave = () =>{
-
-    }
+    const handleLeave = () => {
+      toast("You left the meeting");
+      navigate("/dashboard")
+  }
+  
+  const handleEndMeeting = () => {
+      endMeeting();
+      toast("Meeting ended for all participants");
+      navigate("/dashboard")
+  }
 
     return (
       <div className="h-screen w-screen bg-slate-100 text-slate-900 flex flex-col overflow-hidden relative font-sans">
@@ -61,10 +70,36 @@ const { messages, sendMessage, unreadCount, isChatOpen, toggleChat } = useChat(m
     currentUser={userdata}
 />
 
-    {/* Participants Drawer */}
+   {/* Participants Drawer */}
+<ParticipantList
+    isOpen={isParticipantsOpen}
+    onClose={() => setIsParticipantsOpen(false)}
+    localUser={userdata}
+    localAudio={audioEnabled}
+    localVideo={videoEnabled}
+    remoteUsers={remoteUsers}
+    meetingHostId={dummyUser.id}
+/>
 
-    {/* Bottom Floating Control Bar */}
+  
 </div>
+ {/* Bottom Floating Control Bar */}
+ <ControlBar
+    roomId={meetingId || dummyMeetingDetails.meetingId}
+    audioEnabled={audioEnabled}
+    videoEnabled={videoEnabled}
+    onToggleAudio={toggleAudio}
+    onToggleVideo={toggleVideo}
+    onToggleChat={toggleChat}
+    onToggleParticipants={() => setIsParticipantsOpen((prev) => !prev)}
+    isChatOpen={isChatOpen}
+    isParticipantsOpen={isParticipantsOpen}
+    unreadCount={unreadCount}
+    participantCount={1 + remoteUsers.length}
+    isHost={isHost}
+    onLeave={handleLeave}
+    onEndMeeting={handleEndMeeting}
+/>
       </div>
   )
 }
