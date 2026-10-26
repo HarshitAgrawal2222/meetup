@@ -1,6 +1,6 @@
+
 import { sql } from "./config/db.js";
 
-// Socket.IO Room State: roomId -> Map<socketId, participantObject>
 const rooms = new Map();
 
 export function setupSocketIO(io) {
@@ -8,215 +8,420 @@ export function setupSocketIO(io) {
         let currentRoomId = null;
         let currentUser = null;
 
-        // User joins a meeting room
-        socket.on("join-room", async ({ roomId, user, audioEnabled = true, videoEnabled = true }) => {
+        const isRoomParticipant = (roomId) => {
+            return Boolean(
+                roomId &&
+                currentRoomId === roomId &&
+                rooms.has(roomId) &&
+                rooms.get(roomId).has(socket.id)
+            );
+        };
+
+        socket.on("join-room", async ({
+            roomId,
+            user,
+            audioEnabled = true,
+            videoEnabled = true,
+        } = {}) => {
             try {
-                // Verify meeting status from DB
-                const meetings = await sql`
-                    SELECT * FROM meetings WHERE meeting_id = ${roomId}
-                `;
-                if (meetings.length === 0) {
-                    socket.emit("meeting-ended", { message: "Meeting not found." });
-                    return;
-                }
-                
-                const meeting = meetings[0];
-                
-                if (meeting.status === "ended") {
+                if (!roomId || !user?.id) {
                     socket.emit("meeting-ended", {
-                        message: "This meeting has already ended."
+                        message: "Invalid room or user information.",
                     });
                     return;
                 }
-                
+
+                if (currentRoomId) {
+                    socket.emit("meeting-ended", {
+                        message: "You have already joined a meeting room.",
+                    });
+                    return;
+                }
+
+                const meetings = await sql`
+                    SELECT id, meeting_id, host_id, status
+                    FROM meetings
+                    WHERE meeting_id = ${roomId}
+                    LIMIT 1
+                `;
+
+                if (meetings.length === 0) {
+                    socket.emit("meeting-ended", {
+                        message: "Meeting not found.",
+                    });
+                    return;
+                }
+
+                const meeting = meetings[0];
+
+                if (meeting.status === "ended") {
+                    socket.emit("meeting-ended", {
+                        message: "This meeting has already ended.",
+                    });
+                    return;
+                }
+
+                const hostId = meeting.host_id?.toString();
+                const isHost = Boolean(
+                    hostId && hostId === user.id.toString()
+                );
+
+                const hosts = await sql`
+                    SELECT plan
+                    FROM users
+                    WHERE id = ${meeting.host_id}
+                    LIMIT 1
+                `;
+
+                const hostPlan = hosts[0]?.plan || "free";
+                const maxParticipants =
+                    hostPlan === "premium" ? 100 : 10;
+
+                if (!rooms.has(roomId)) {
+                    rooms.set(roomId, new Map());
+                }
+
+                const roomParticipants = rooms.get(roomId);
+
+                if (roomParticipants.size >= maxParticipants) {
+                    socket.emit("meeting-ended", {
+                        message: `Meeting capacity limit reached. Maximum participants: ${maxParticipants}.`,
+                    });
+
+                    if (roomParticipants.size === 0) {
+                        rooms.delete(roomId);
+                    }
+
+                    return;
+                }
+
+                const participantName = user.name || "Anonymous";
+                const userId = user.id;
+
+                const existingParticipants = await sql`
+                    SELECT id
+                    FROM meeting_participants
+                    WHERE meeting_id = ${meeting.id}
+                    AND (
+                        user_id = ${userId}
+                        OR name = ${participantName}
+                    )
+                    LIMIT 1
+                `;
+
+                if (existingParticipants.length === 0) {
+                    await sql`
+                        INSERT INTO meeting_participants
+                            (meeting_id, user_id, name, joined_at)
+                        VALUES (
+                            ${meeting.id},
+                            ${userId},
+                            ${participantName},
+                            NOW()
+                        )
+                    `;
+                }
+
+                currentUser = {
+                    socketId: socket.id,
+                    userId,
+                    userName: participantName,
+                    isHost,
+                    audioEnabled,
+                    videoEnabled,
+                };
+
                 currentRoomId = roomId;
-                
-                const isHost = meeting.host_id && user?.id &&
-                    meeting.host_id.toString() === user.id.toString();
-                
-                    currentUser = {
-                        socketId: socket.id,
-                        userId: user?.id,
-                        userName: user?.name || "Anonymous",
-                        isHost,
-                        audioEnabled,
-                        videoEnabled,
+
+                const existingUsers = Array.from(
+                    roomParticipants.values()
+                );
+
+                roomParticipants.set(socket.id, currentUser);
+
+                socket.join(roomId);
+
+                socket.emit("all-users", existingUsers);
+
+                socket.to(roomId).emit("user-joined", currentUser);
+            } catch (error) {
+                console.error("Error joining room in socket:", error);
+
+                socket.emit("meeting-ended", {
+                    message: "Failed to join room. Please try again.",
+                });
+
+                if (currentRoomId && rooms.has(currentRoomId)) {
+                    rooms.get(currentRoomId).delete(socket.id);
+                    socket.leave(currentRoomId);
+
+                    if (rooms.get(currentRoomId).size === 0) {
+                        rooms.delete(currentRoomId);
                     }
-                    
-                    if (!rooms.has(roomId)) {
-                        rooms.set(roomId, new Map())
-                    }
-                    
-                    const roomParticipants = rooms.get(roomId);
-                    
-                   // Fetch host plan to enforce participant limits (10 for Free, 100 for Premium)
-const hosts = await sql`SELECT plan FROM users WHERE id = ${meeting.host_id}`;
+                }
 
-const hostPlan = hosts[0]?.plan || "free";
-const maxParticipants = hostPlan === "premium" ? 100 : 10;
-
-if (roomParticipants.size >= maxParticipants) {
-    socket.emit("meeting-ended", {
-        message: `Meeting capacity limit reached (max ${maxParticipants} participants for ${hostPlan.toUpperCase()} plan). Host must upgrade to Premium for up to 100 participants!`,
-    });
-    return;
-}
-
-socket.join(roomId);
-// Get existing participants in the room
-const existingUsers = Array.from(roomParticipants.values());
-
-// Add new participant to socket state
-roomParticipants.set(socket.id, currentUser);
-
-// Save participant into DB if not already present
-const userId = user?.id || null;
-
-const existingParticipants = await sql`
-    SELECT id FROM meeting_participants
-    WHERE meeting_id = ${meeting.id}
-    AND ((${userId}::text IS NOT NULL AND user_id = ${userId}) OR name = ${currentUser.userName})
-`;
-
-if (existingParticipants.length === 0) {
-    await sql`
-    INSERT INTO meeting_participants (meeting_id, user_id, name, joined_at)
-    VALUES (${meeting.id}, ${userId}, ${currentUser.userName}, NOW())
-`;
-}
-
-// Send list of existing users to the newcomer
-socket.emit("all-users", existingUsers);
-
-// Notify everyone else in the room
-socket.to(roomId).emit("user-joined", currentUser);
-
-            } catch (err) {
-                console.error("Error joining room in socket:", err);
-                socket.emit("meeting-ended", { message: "Failed to join room." });
+                currentRoomId = null;
+                currentUser = null;
             }
         });
-        // WebRTC Signaling: Offer
-// send the information needed to start the connection
-socket.on('offer', ({targetSocketId, callerSocketId, sdp}) => {
-    io.to(targetSocketId).emit("offer", {
-        callerSocketId,
-        sdp,
-        callerUser: currentUser,
-    })
-})
 
-// WebRTC Signaling: Answer
-// accept the offer request and process the connection
-socket.on('answer', ({targetSocketId, responderSocketId, sdp}) => {
-    io.to(targetSocketId).emit("answer", {
-        responderSocketId,
-        sdp,
-        callerUser: currentUser,
-    })
-})
-// WebRTC Signaling: ICE Candidate
-// passes the connection details from one user to the other so WebRTC can figure
-// out how to connect them directly.
-socket.on('ice-candidate', ({ targetSocketId, senderSocketId, candidate }) => {
-    io.to(targetSocketId).emit("ice-candidate", {
-        senderSocketId,
-        candidate,
-    })
-})
+        socket.on(
+            "offer",
+            ({ targetSocketId, callerSocketId, sdp } = {}) => {
+                if (!currentRoomId || !isRoomParticipant(currentRoomId)) {
+                    return;
+                }
 
-// Audio toggle event
-socket.on('toggle-audio', ({ roomId, audioEnabled }) => {
-    if (rooms.has(roomId) && rooms.get(roomId).has(socket.id)) {
-        rooms.get(roomId).get(socket.id).audioEnabled = audioEnabled;
-    }
-    socket.to(roomId).emit('user-toggled-audio',
-        {
-            socketId:socket.id,
-            audioEnabled,
-        }
-    )
+                if (
+                    !targetSocketId ||
+                    !sdp ||
+                    callerSocketId !== socket.id
+                ) {
+                    return;
+                }
 
-})
+                const participants = rooms.get(currentRoomId);
 
-// Video toggle event
-socket.on('toggle-video', ({ roomId, videoEnabled }) => {
-    if (rooms.has(roomId) && rooms.get(roomId).has(socket.id)) {
-        rooms.get(roomId).get(socket.id).videoEnabled = videoEnabled;
-    }
-    socket.to(roomId).emit('user-toggled-video',
-        {
-            socketId:socket.id,
-            videoEnabled,
-        }
-    )
+                if (!participants?.has(targetSocketId)) {
+                    return;
+                }
 
-})
+                io.to(targetSocketId).emit("offer", {
+                    callerSocketId: socket.id,
+                    sdp,
+                    callerUser: currentUser,
+                });
+            }
+        );
 
-// Chat message event -> persist to DB & broadcast
-socket.on("send-message", async ({ roomId, message }) => {
-    try {
-        const meetings = await sql`SELECT id, status FROM meetings WHERE meeting_id = ${roomId}`;
+        socket.on(
+            "answer",
+            ({ targetSocketId, responderSocketId, sdp } = {}) => {
+                if (!currentRoomId || !isRoomParticipant(currentRoomId)) {
+                    return;
+                }
 
-        if (meetings.length > 0 && meetings[0].status !== "ended") {
-            const meetingId = meetings[0].id;
-            const senderId = message.senderId || null;
+                if (
+                    !targetSocketId ||
+                    !sdp ||
+                    responderSocketId !== socket.id
+                ) {
+                    return;
+                }
 
-            await sql`
-                INSERT INTO meeting_messages (meeting_id, sender_id, sender_name, text, timestamp)
-                VALUES (
-                    ${meetingId},
-                    ${senderId},
-                    ${message.senderName || "Anonymous"},
-                    ${message.text},
-                    NOW()
-                )
-            `;
+                const participants = rooms.get(currentRoomId);
 
-            io.in(roomId).emit("receive-message", {
-                ...message,
-                senderSocketId: socket.id,
+                if (!participants?.has(targetSocketId)) {
+                    return;
+                }
+
+                io.to(targetSocketId).emit("answer", {
+                    responderSocketId: socket.id,
+                    sdp,
+                    responderUser: currentUser,
+                });
+            }
+        );
+
+        socket.on(
+            "ice-candidate",
+            ({ targetSocketId, senderSocketId, candidate } = {}) => {
+                if (!currentRoomId || !isRoomParticipant(currentRoomId)) {
+                    return;
+                }
+
+                if (
+                    !targetSocketId ||
+                    !candidate ||
+                    senderSocketId !== socket.id
+                ) {
+                    return;
+                }
+
+                const participants = rooms.get(currentRoomId);
+
+                if (!participants?.has(targetSocketId)) {
+                    return;
+                }
+
+                io.to(targetSocketId).emit("ice-candidate", {
+                    senderSocketId: socket.id,
+                    candidate,
+                });
+            }
+        );
+
+        socket.on("toggle-audio", ({ roomId, audioEnabled } = {}) => {
+            if (
+                roomId !== currentRoomId ||
+                typeof audioEnabled !== "boolean" ||
+                !isRoomParticipant(roomId)
+            ) {
+                return;
+            }
+
+            const participant = rooms.get(roomId).get(socket.id);
+            participant.audioEnabled = audioEnabled;
+
+            socket.to(roomId).emit("user-toggled-audio", {
+                socketId: socket.id,
+                audioEnabled,
             });
-        }
-    } catch (error) {
-        console.error("Error sending message:", error);
-    }
-});
-// Host explicitly ends meeting for all via End Meeting button
-socket.on('end-meeting', async ({ roomId }) => {
-    try {
-        await sql`
-            UPDATE meetings
-            SET status = 'ended', ended_at = NOW()
-            WHERE meeting_id = ${roomId}
-        `;
-
-        io.to(roomId).emit("meeting-ended", {
-            message: "The meeting has been ended by the host."
         });
 
-        rooms.delete(roomId);
-    } catch (err) {
-        console.error("Error ending meeting:", err);
-    }
+        socket.on("toggle-video", ({ roomId, videoEnabled } = {}) => {
+            if (
+                roomId !== currentRoomId ||
+                typeof videoEnabled !== "boolean" ||
+                !isRoomParticipant(roomId)
+            ) {
+                return;
+            }
 
-});
-// Handle Disconnect (Reloading window, network drop, or closing tab)
-socket.on('disconnect', () => {
-    if (currentRoomId && rooms.has(currentRoomId)) {
-        const roomParticipants = rooms.get(currentRoomId);
-        roomParticipants.delete(socket.id);
+            const participant = rooms.get(roomId).get(socket.id);
+            participant.videoEnabled = videoEnabled;
 
-        if (roomParticipants.size === 0) {
-            rooms.delete(currentRoomId);
-        } else {
-            // Notify remaining peers that a user disconnected
-            socket.to(currentRoomId).emit("user-left", {
+            socket.to(roomId).emit("user-toggled-video", {
                 socketId: socket.id,
-                user: currentUser,
+                videoEnabled,
             });
-        }
-    }
-})
+        });
+
+        socket.on("send-message", async ({ roomId, message } = {}) => {
+            try {
+                if (
+                    roomId !== currentRoomId ||
+                    !isRoomParticipant(roomId) ||
+                    !message ||
+                    typeof message.text !== "string" ||
+                    !message.text.trim()
+                ) {
+                    return;
+                }
+
+                const meetings = await sql`
+                    SELECT id, status
+                    FROM meetings
+                    WHERE meeting_id = ${roomId}
+                    LIMIT 1
+                `;
+
+                if (
+                    meetings.length === 0 ||
+                    meetings[0].status === "ended"
+                ) {
+                    socket.emit("meeting-ended", {
+                        message: "This meeting has ended.",
+                    });
+                    return;
+                }
+
+                const meetingId = meetings[0].id;
+                const senderName = currentUser.userName;
+                const text = message.text.trim();
+
+                await sql`
+                    INSERT INTO meeting_messages
+                        (meeting_id, sender_id, sender_name, text, timestamp)
+                    VALUES (
+                        ${meetingId},
+                        ${currentUser.userId},
+                        ${senderName},
+                        ${text},
+                        NOW()
+                    )
+                `;
+
+                io.to(roomId).emit("receive-message", {
+                    ...message,
+                    senderId: currentUser.userId,
+                    senderName,
+                    text,
+                    senderSocketId: socket.id,
+                });
+            } catch (error) {
+                console.error("Error sending message:", error);
+            }
+        });
+
+        socket.on("end-meeting", async ({ roomId } = {}) => {
+            try {
+                if (
+                    roomId !== currentRoomId ||
+                    !isRoomParticipant(roomId) ||
+                    !currentUser?.isHost
+                ) {
+                    socket.emit("meeting-action-error", {
+                        message: "Only the meeting host can end this meeting.",
+                    });
+                    return;
+                }
+
+                const result = await sql`
+                    UPDATE meetings
+                    SET status = 'ended', ended_at = NOW()
+                    WHERE meeting_id = ${roomId}
+                    AND host_id = ${currentUser.userId}
+                    AND status <> 'ended'
+                    RETURNING id
+                `;
+
+                if (result.length === 0) {
+                    socket.emit("meeting-action-error", {
+                        message: "Meeting not found or already ended.",
+                    });
+                    return;
+                }
+
+                io.to(roomId).emit("meeting-ended", {
+                    message: "The meeting has been ended by the host.",
+                });
+
+                const participants = rooms.get(roomId);
+
+                if (participants) {
+                    for (const socketId of participants.keys()) {
+                        const participantSocket = io.sockets.sockets.get(
+                            socketId
+                        );
+
+                        if (participantSocket) {
+                            participantSocket.leave(roomId);
+                        }
+                    }
+                }
+
+                rooms.delete(roomId);
+            } catch (error) {
+                console.error("Error ending meeting:", error);
+
+                socket.emit("meeting-action-error", {
+                    message: "Could not end the meeting. Please try again.",
+                });
+            }
+        });
+
+        socket.on("disconnect", () => {
+            if (!currentRoomId || !rooms.has(currentRoomId)) {
+                return;
+            }
+
+            const roomId = currentRoomId;
+            const roomParticipants = rooms.get(roomId);
+
+            roomParticipants.delete(socket.id);
+
+            if (roomParticipants.size === 0) {
+                rooms.delete(roomId);
+            } else {
+                socket.to(roomId).emit("user-left", {
+                    socketId: socket.id,
+                    user: currentUser,
+                });
+            }
+
+            currentRoomId = null;
+            currentUser = null;
+        });
     });
 }
